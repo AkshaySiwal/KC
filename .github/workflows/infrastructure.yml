@@ -1,0 +1,161 @@
+name: Infrastructure Deployment
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/infrastructure.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'terraform/**'
+
+env:
+  PRIMARY_REGION: me-south-1
+  DR_REGION: eu-central-1
+  TERRAFORM_VERSION: 1.5.0
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
+
+  plan:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [me-south-1, eu-central-1]
+        include:
+          - region: me-south-1
+            environment: production
+          - region: eu-central-1
+            environment: dr
+
+    environment: ${{ matrix.environment }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=knowledgecity-terraform-${{ matrix.region }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ matrix.region }}"
+
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var-file="environments/${{ matrix.environment }}/terraform.tfvars" \
+            -out=tfplan-${{ matrix.region }} \
+            -detailed-exitcode
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfplan-${{ matrix.region }}
+          path: terraform/tfplan-${{ matrix.region }}
+
+  apply:
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [me-south-1, eu-central-1]
+        include:
+          - region: me-south-1
+            environment: production
+          - region: eu-central-1
+            environment: dr
+
+    environment: 
+      name: ${{ matrix.environment }}
+      url: https://console.aws.amazon.com/eks/home?region=${{ matrix.region }}#/clusters/knowledgecity-${{ matrix.environment }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: tfplan-${{ matrix.region }}
+          path: terraform
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=knowledgecity-terraform-${{ matrix.region }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ matrix.region }}"
+          terraform apply -auto-approve tfplan-${{ matrix.region }}
+
+      - name: Update EKS Kubeconfig
+        if: success()
+        run: |
+          aws eks update-kubeconfig \
+            --name knowledgecity-${{ matrix.environment }} \
+            --region ${{ matrix.region }}
+
+  notify:
+    needs: [apply]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
