@@ -1,0 +1,151 @@
+name: Applications Deployment
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'apps/**'
+      - 'kubernetes/**'
+      - '.github/workflows/applications.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'apps/**'
+      - 'kubernetes/**'
+
+env:
+  PRIMARY_REGION: me-south-1
+  DR_REGION: eu-central-1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [api, reporting-service, media-server]
+        include:
+          - app: api
+            dockerfile: apps/api/Dockerfile
+            context: apps/api
+          - app: reporting-service
+            dockerfile: apps/reporting/Dockerfile
+            context: apps/reporting
+          - app: media-server
+            dockerfile: apps/media/Dockerfile
+            context: apps/media
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.PRIMARY_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and Push Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/knowledgecity-${{ matrix.app }}:$IMAGE_TAG \
+            -f ${{ matrix.dockerfile }} ${{ matrix.context }}
+          docker push $ECR_REGISTRY/knowledgecity-${{ matrix.app }}:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/knowledgecity-${{ matrix.app }}:$IMAGE_TAG"
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [me-south-1, eu-central-1]
+        include:
+          - region: me-south-1
+            environment: production
+          - region: eu-central-1
+            environment: dr
+
+    environment:
+      name: ${{ matrix.environment }}
+      url: https://api.${{ matrix.environment }}.knowledgecity.com
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Update EKS Kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name knowledgecity-${{ matrix.environment }} \
+            --region ${{ matrix.region }}
+
+      - name: Deploy Applications
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for app in api reporting-service media-server; do
+            kubectl set image deployment/$app \
+              $app=$ECR_REGISTRY/knowledgecity-$app:$IMAGE_TAG \
+              -n applications
+
+            kubectl rollout status deployment/$app -n applications --timeout=300s
+          done
+
+      - name: Verify Deployment
+        run: |
+          for app in api reporting-service media-server; do
+            kubectl get deployment $app -n applications -o jsonpath='{.status.availableReplicas}'
+          done
+
+  rollback:
+    needs: deploy
+    if: failure()
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [me-south-1, eu-central-1]
+        include:
+          - region: me-south-1
+            environment: production
+          - region: eu-central-1
+            environment: dr
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Rollback Deployments
+        run: |
+          aws eks update-kubeconfig \
+            --name knowledgecity-${{ matrix.environment }} \
+            --region ${{ matrix.region }}
+
+          for app in api reporting-service media-server; do
+            kubectl rollout undo deployment/$app -n applications
+          done
+
+      - name: Notify Rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: warning
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          text: "Deployment failed, rollback initiated for ${{ matrix.environment }} in ${{ matrix.region }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
