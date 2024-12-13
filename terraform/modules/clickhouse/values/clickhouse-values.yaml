@@ -1,0 +1,38 @@
+auth:
+  username: admin
+  password: changeme  # Should be replaced with a secure password
+
+persistence:
+  enabled: true
+  size: 100Gi
+
+resources:
+  requests:
+    memory: 4Gi
+    cpu: 2
+  limits:
+    memory: 8Gi
+    cpu: 4
+
+service:
+  type: ClusterIP
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+configuration:
+  users:
+    default/password: changeme  # Should be replaced with a secure password
+    default/networks/ip: "::/0"
+  
+  clusters:
+    main:
+      layout:
+        shardsCount: 1
+        replicasCount: 2
+
+zookeeper:
+  enabled: true
+  replicaCount: 3

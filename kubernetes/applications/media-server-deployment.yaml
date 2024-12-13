@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media-server-deployment
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: media-server
+  template:
+    metadata:
+      labels:
+        app: media-server
+    spec:
+      containers:
+      - name: media-server
+        image: ${ECR_REGISTRY}/media-server:latest
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: media-storage
+          mountPath: /app/media
+        env:
+        - name: AWS_S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: media-config
+              key: s3_bucket
+        - name: AWS_KMS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: media-secrets
+              key: kms_key_id
+      volumes:
+      - name: media-storage
+        emptyDir: {}
